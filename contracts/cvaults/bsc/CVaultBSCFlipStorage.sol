@@ -14,15 +14,15 @@ contract CVaultBSCFlipStorage is CVaultBSCFlipState, PausableUpgradeable {
     ICVaultRelayer public relayer;
 
     modifier increaseNonceOnlyRelayer(address lp, address _account, uint nonce) {
-        require(msg.sender == address(relayer), "FlipVault: not relayer");
-        require(_pools[lp].vault != address(0), "FlipVault: not pool");
-        require(accountOf(lp, _account).nonce == nonce, "FlipVault: invalid nonce");
+        require(msg.sender == address(relayer), "CVaultBSCFlipStorage: not relayer");
+        require(_pools[lp].cpool != address(0), "CVaultBSCFlipStorage: not pool");
+        require(accountOf(lp, _account).nonce == nonce, "CVaultBSCFlipStorage: invalid nonce");
         _;
         increaseNonce(lp, _account);
     }
 
     modifier validLeverage(uint128 leverage) {
-        require(LEVERAGE_MIN <= leverage && leverage <= LEVERAGE_MAX, "FlipVault: leverage range should be [10%-150%]");
+        require(LEVERAGE_MIN <= leverage && leverage <= LEVERAGE_MAX, "CVaultBSCFlipStorage: leverage range should be [10%-150%]");
         _;
     }
 
@@ -34,20 +34,20 @@ contract CVaultBSCFlipStorage is CVaultBSCFlipState, PausableUpgradeable {
 
     // ---------- VIEW ----------
 
-    function vaultOf(address lp) public view returns(address) {
-        return _pools[lp].vault;
+    function cpoolOf(address lp) public view returns(address) {
+        return _pools[lp].cpool;
     }
 
     function flipOf(address lp) public view returns(address) {
         return _pools[lp].flip;
     }
 
-    function accountOf(address lp, address account) public view returns(Account memory) {
-        return _pools[lp].accounts[account];
+    function stateOf(address lp, address account) public view returns(State) {
+        return _pools[lp].accounts[account].state;
     }
 
-    function isRelayer(address account) external view returns(bool) {
-        return address(relayer) == account;
+    function accountOf(address lp, address account) public view returns(Account memory) {
+        return _pools[lp].accounts[account];
     }
 
     // ---------- RESTRICTED ----------
@@ -56,10 +56,10 @@ contract CVaultBSCFlipStorage is CVaultBSCFlipState, PausableUpgradeable {
         relayer = ICVaultRelayer(newRelayer);
     }
 
-    function _setPool(address lp, address vault, address flip) internal onlyOwner {
-        require(_pools[lp].vault == address(0) && _pools[lp].flip == address(0), "CVaultBSCFlipStorage: set already");
-        _pools[lp].vault = vault;
+    function _setPool(address lp, address flip, address cpool) internal onlyOwner {
+        require(_pools[lp].cpool == address(0) && _pools[lp].flip == address(0), "CVaultBSCFlipStorage: set already");
         _pools[lp].flip = flip;
+        _pools[lp].cpool = cpool;
     }
 
     function increaseNonce(address lp, address _account) private {
@@ -74,11 +74,11 @@ contract CVaultBSCFlipStorage is CVaultBSCFlipState, PausableUpgradeable {
         }
 
         if (state == State.Idle) {
-            require(current == State.Farming, "FlipVault: can't convert to Idle");
+            require(current == State.Farming, "CVaultBSCFlipStorage: can't convert to Idle");
         } else if (state == State.Farming) {
 
         } else {
-            revert("FlipVault: invalid state");
+            revert("CVaultBSCFlipStorage: invalid state");
         }
 
         account.state = state;

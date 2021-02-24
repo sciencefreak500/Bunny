@@ -8,14 +8,16 @@ import "@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol";
 
 import "../../../library/bep20/BEP20Upgradeable.sol";
 import "../../../library/SafeToken.sol";
-import "./BankConfig.sol";
 import "../../../library/Whitelist.sol";
-import "../../interface/ILender.sol";
+import "../../interface/IBankBNB.sol";
+import "./config/BankConfig.sol";
 
 
-contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whitelist {
+contract BankBNB is IBankBNB, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whitelist {
     using SafeToken for address;
     using SafeBEP20 for IBEP20;
+
+    /* ========== STATE VARIABLES ========== */
 
     BankConfig public config;
 
@@ -24,14 +26,17 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
     uint public lastAccrueTime;
     uint public reservePool;
 
-    address public ethVault;
+    address public bankETH;
 
     mapping (address => mapping (address => uint)) private _debt;
 
+    /* ========== EVENTS ========== */
+
     event AddDebt(address indexed pool, address indexed borrower, uint256 debtShare);
     event RemoveDebt(address indexed pool, address indexed borrower, uint256 debtShare);
-
     event HandOverDebt(address indexed pool, address indexed borrower, address indexed handOverTo, uint256 debtShare);
+
+    /* ========== MODIFIERS ========== */
 
     modifier accrue(uint msgValue) {
         if (now > lastAccrueTime) {
@@ -44,10 +49,12 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
         _;
     }
 
-    modifier onlyETHVault {
-        require(msg.sender == ethVault, "VaultBNB: not ethVault");
+    modifier onlyBankETH {
+        require(msg.sender == bankETH, "BankBNB: caller is not bankETH");
         _;
     }
+
+    /* ========== INITIALIZER ========== */
 
     function initialize(string memory name, string memory symbol, uint8 decimals) external initializer {
         __BEP20__init(name, symbol, decimals);
@@ -57,7 +64,7 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
         lastAccrueTime = block.timestamp;
     }
 
-    // -------------------- VIEW FUNCTIONS -------------------
+    /* ========== VIEW FUNCTIONS ========== */
 
     /// @dev Return the pending interest that will be accrued in the next call.
     /// @param msgValue Balance value to subtract off address(this).balance when called from payable functions.
@@ -82,7 +89,7 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
     }
 
     function debtValOfETHVault() external view returns(uint) {
-        return debtShareToVal(debtShareOf(address(this), ethVault));
+        return debtShareToVal(debtShareOf(address(this), bankETH));
     }
 
     function debtShareOf(address pool, address account) public view override returns(uint) {
@@ -103,12 +110,13 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
         return debtVal.mul(glbDebtShare).div(glbDebtVal);
     }
 
-    function getUtilizationInfo() external view override returns(uint total, uint debt) {
-        total = totalBNB();
-        debt = glbDebtVal;
+    function getUtilizationInfo() external view override returns(uint totalSupply, uint utilized) {
+        totalSupply = totalBNB();
+        utilized = glbDebtVal;
     }
 
-    // -------------------- EXTERNAL FUNCTIONS -------------------
+    /* ========== MUTATIVE FUNCTIONS ========== */
+
     /// @dev Add more BNB to the bank. Hope to get some good returns.
     function deposit() external payable accrue(msg.value) nonReentrant {
         uint total = totalBNB().sub(msg.value);
@@ -127,7 +135,8 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
         return debtShareToVal(debtShareOf(pool, account));
     }
 
-    // ------------- RESTRICTED FUNCTIONS ----------------
+    /* ========== RESTRICTED FUNCTIONS ========== */
+
     // @return DebtShares of borrower
     function borrow(address pool, address borrower, uint debtVal) external override accrue(0) onlyWhitelisted returns(uint debtSharesOfBorrower) {
         debtVal = Math.min(debtVal, address(this).balance);
@@ -156,10 +165,10 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
         return _debt[pool][borrower];
     }
 
-    function handOverDebtToTreasury(address pool, address borrower) external override accrue(0) onlyETHVault returns(uint debtSharesOfBorrower) {
+    function handOverDebtToTreasury(address pool, address borrower) external override accrue(0) onlyBankETH returns(uint debtSharesOfBorrower) {
         uint debtShare = _debt[pool][borrower];
         _debt[pool][borrower] = 0;
-        _debt[address(this)][ethVault] = _debt[address(this)][ethVault].add(debtShare); // The debt belongs to treasury
+        _debt[address(this)][bankETH] = _debt[address(this)][bankETH].add(debtShare); // The debt belongs to treasury
 
         if (debtShare > 0) {
             emit HandOverDebt(pool, borrower, msg.sender, debtShare);
@@ -168,13 +177,13 @@ contract VaultBNB is ILender, BEP20Upgradeable, ReentrancyGuardUpgradeable, Whit
         return debtShare;
     }
 
-    function repayTreasuryDebt() external payable override accrue(msg.value) onlyETHVault returns(uint debtSharesOfBorrower) {
-        return repay(address(this), ethVault);
+    function repayTreasuryDebt() external payable override accrue(msg.value) onlyBankETH returns(uint debtSharesOfBorrower) {
+        return repay(address(this), bankETH);
     }
 
-    function setETHVault(address newETHVault) external onlyOwner {
-        require(ethVault == address(0), "VaultBNB: set ethVault only once");
-        ethVault = newETHVault;
+    function setBankETH(address newBankETH) external onlyOwner {
+        require(bankETH == address(0), "BankBNB: bankETH is already set");
+        bankETH = newBankETH;
     }
 
     /// @dev Update bank configuration to a new address. Must only be called by owner.

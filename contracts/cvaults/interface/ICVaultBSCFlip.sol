@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.6.12;
 
-import "./ILender.sol";
-
 /*
   ___                      _   _
  | _ )_  _ _ _  _ _ _  _  | | | |
@@ -34,13 +32,18 @@ import "./ILender.sol";
 * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 */
 
+import "./IBankBNB.sol";
+import "./IBankETH.sol";
+
+
 interface ICVaultBSCFlip {
+    function getUtilizationInfo() external view returns(uint totalSupply, uint utilized);
+    function bankBNB() external view returns(IBankBNB);
+    function bankETH() external view returns(IBankETH);
+
     function deposit(address lp, address account, uint128 eventId, uint112 nonce, uint128 leverage, uint collateral) external returns (uint bscBNBDebtShare, uint bscFlipBalance);
     function updateLeverage(address lp, address account, uint128 eventId, uint112 nonce, uint128 leverage, uint collateral) external returns (uint bscBNBDebtShare, uint bscFlipBalance);
     function withdrawAll(address lp, address account, uint128 eventId, uint112 nonce) external returns (uint ethProfit, uint ethLoss);
     function emergencyExit(address lp, address account, uint128 eventId, uint112 nonce) external returns (uint ethProfit, uint ethLoss);
     function liquidate(address lp, address account, uint128 eventId, uint112 nonce) external returns (uint ethProfit, uint ethLoss);
-
-    function getUtilizationInfo() external view returns(uint totalBNB, uint debt);
-    function lender() external view returns(ILender);
 }

@@ -9,34 +9,39 @@ import "../../../interfaces/IPancakePair.sol";
 import "../../../interfaces/IPancakeRouter02.sol";
 
 import "../../../library/PausableUpgradeable.sol";
-import "../../interface/ILender.sol";
 import "../../../library/Whitelist.sol";
+import "../../interface/IBankBNB.sol";
+import "../../interface/IBankETH.sol";
 
-contract BSCVaultETH is PausableUpgradeable, Whitelist {
+
+contract BankETH is IBankETH, PausableUpgradeable, Whitelist {
     using SafeMath for uint256;
     using SafeBEP20 for IBEP20;
 
+    uint private constant PERFORMANCE_FEE_MAX = 10000;
+
     address private constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
     address private constant ETH = 0x2170Ed0880ac9A755fd29B2688956BD959F933F8;
-    uint private constant MAX = 10000;
     IPancakeRouter02 private constant ROUTER = IPancakeRouter02(0x05fF2B0DB69458A0750badebc4f9e13aDd608C7F);
 
+    /* ========== STATE VARIABLES ========== */
+
     uint public PERFORMANCE_FEE;
-    ILender private _lender;
-
-    address public keeper;
-
     uint private _treasuryFund;
     uint private _treasuryDebt;
+    address public keeper;
+    address public bankBNB;
 
-    receive() external payable {}
+    /* ========== MODIFIERS ========== */
 
     modifier onlyKeeper {
-        require(msg.sender == keeper || msg.sender == owner(), "BSCVaultETH: not keeper");
+        require(msg.sender == keeper || msg.sender == owner(), "BankETH: not keeper");
         _;
     }
 
-    // INITIALIZER
+    /* ========== INITIALIZER ========== */
+
+    receive() external payable {}
 
     function initialize() external initializer {
         __PausableUpgradeable_init();
@@ -46,14 +51,10 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         IBEP20(ETH).safeApprove(address(ROUTER), uint(-1));
     }
 
-    // VIEWS
+    /* ========== VIEW FUNCTIONS ========== */
 
     function balance() external view returns(uint) {
         return IBEP20(ETH).balanceOf(address(this));
-    }
-
-    function lender() external view returns(address) {
-        return address(_lender);
     }
 
     function treasuryFund() external view returns(uint) {
@@ -64,26 +65,19 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         return _treasuryDebt;
     }
 
-    // RESTRICTED - onlyOwner
-
-    function setPerformanceFee(uint newPerformanceFee) external onlyOwner {
-        require(newPerformanceFee <= 5000, "BSCVaultETH: fee too much");
-        PERFORMANCE_FEE = newPerformanceFee;
-    }
-
-    function setLender(address newLender) external onlyOwner {
-        require(address(_lender) == address(0), "BSCVaultETH: setLender only once");
-        _lender = ILender(newLender);
-
-        IBEP20(ETH).safeApprove(newLender, uint(-1));
-    }
+    /* ========== RESTRICTED FUNCTIONS - OWNER ========== */
 
     function setKeeper(address newKeeper) external onlyOwner {
         keeper = newKeeper;
     }
 
+    function setPerformanceFee(uint newPerformanceFee) external onlyOwner {
+        require(newPerformanceFee <= 5000, "BankETH: fee too much");
+        PERFORMANCE_FEE = newPerformanceFee;
+    }
+
     function recoverToken(address _token, uint amount) external onlyOwner {
-        require(_token != ETH, 'BSCVaultETH: cannot recover eth token');
+        require(_token != ETH, 'BankETH: cannot recover eth token');
         if (_token == address(0)) {
             payable(owner()).transfer(amount);
         } else {
@@ -91,15 +85,23 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         }
     }
 
-    // RESTRICTED - Keeper
+    function setBankBNB(address newBankBNB) external onlyOwner {
+        require(bankBNB == address(0), "BankETH: bankBNB is already set");
+        bankBNB = newBankBNB;
+
+        IBEP20(ETH).safeApprove(newBankBNB, uint(-1));
+    }
+
+    /* ========== RESTRICTED FUNCTIONS - KEEPER ========== */
+
     function repayTreasuryDebt() external onlyKeeper returns(uint ethAmount) {
         address[] memory path = new address[](2);
         path[0] = ETH;
         path[1] = WBNB;
 
-        uint debt = _lender.accruedDebtValOf(address(this), address(this));
+        uint debt = IBankBNB(bankBNB).accruedDebtValOf(address(this), address(this));
         ethAmount = ROUTER.getAmountsIn(debt, path)[0];
-        require(ethAmount <= IBEP20(ETH).balanceOf(address(this)), "BSCVaultETH: insufficient eth");
+        require(ethAmount <= IBEP20(ETH).balanceOf(address(this)), "BankETH: insufficient eth");
 
         if (_treasuryDebt >= ethAmount) {
             _treasuryFund = _treasuryFund.add(_treasuryDebt.sub(ethAmount));
@@ -110,7 +112,7 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
             _treasuryDebt = 0;
             _repayTreasuryDebt(debt, ethAmount);
         } else {
-            revert("BSCVaultETH: not enough eth balance");
+            revert("BankETH: not enough eth balance");
         }
     }
 
@@ -119,9 +121,9 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         IBEP20(ETH).safeTransfer(to, ethAmount);
     }
 
-    // RESTRICTED - Cross farming contract only
+    /* ========== RESTRICTED FUNCTIONS - WHITELISTED ========== */
 
-    function repayOrHandOverDebt(address lp, address account, uint debt) external onlyWhitelisted returns(uint ethAmount)  {
+    function repayOrHandOverDebt(address lp, address account, uint debt) external override onlyWhitelisted returns(uint ethAmount)  {
         if (debt == 0) return 0;
 
         address[] memory path = new address[](2);
@@ -133,26 +135,28 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         if (ethAmount <= ethBalance) {
             // repay
             uint[] memory amounts = ROUTER.swapTokensForExactETH(debt, ethAmount, path, address(this), block.timestamp);
-            _lender.repay{ value: amounts[1] }(lp, account);
+            IBankBNB(bankBNB).repay{ value: amounts[1] }(lp, account);
         } else {
             if (ethBalance > 0) {
                 uint[] memory amounts = ROUTER.swapExactTokensForETH(ethBalance, 0, path, address(this), block.timestamp);
-                _lender.repay{ value: amounts[1] }(lp, account);
+                IBankBNB(bankBNB).repay{ value: amounts[1] }(lp, account);
             }
 
             _treasuryDebt = _treasuryDebt.add(ethAmount.sub(ethBalance));
             // insufficient ETH !!!!
             // handover BNB debt
-            _lender.handOverDebtToTreasury(lp, account);
+            IBankBNB(bankBNB).handOverDebtToTreasury(lp, account);
         }
     }
+
+    /* ========== MUTATIVE FUNCTIONS ========== */
 
     function depositTreasuryFund(uint ethAmount) external {
         IBEP20(ETH).transferFrom(msg.sender, address(this), ethAmount);
         _treasuryFund = _treasuryFund.add(ethAmount);
     }
 
-    function transferProfit() external payable returns(uint ethAmount) {
+    function transferProfit() external override payable returns(uint ethAmount) {
         if (msg.value == 0) return 0;
 
         address[] memory path = new address[](2);
@@ -160,13 +164,13 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         path[1] = ETH;
 
         uint[] memory amounts = ROUTER.swapExactETHForTokens{ value : msg.value }(0, path, address(this), block.timestamp);
-        uint fee = amounts[1].mul(PERFORMANCE_FEE).div(MAX);
+        uint fee = amounts[1].mul(PERFORMANCE_FEE).div(PERFORMANCE_FEE_MAX);
 
         _treasuryFund = _treasuryFund.add(fee);
         ethAmount = amounts[1].sub(fee);
     }
 
-    // Private functions
+    /* ========== PRIVATE FUNCTIONS ========== */
 
     function _repayTreasuryDebt(uint debt, uint maxETHAmount) private {
         address[] memory path = new address[](2);
@@ -174,6 +178,6 @@ contract BSCVaultETH is PausableUpgradeable, Whitelist {
         path[1] = WBNB;
 
         uint[] memory amounts = ROUTER.swapTokensForExactETH(debt, maxETHAmount, path, address(this), block.timestamp);
-        _lender.repayTreasuryDebt{ value: amounts[1] }();
+        IBankBNB(bankBNB).repayTreasuryDebt{ value: amounts[1] }();
     }
 }

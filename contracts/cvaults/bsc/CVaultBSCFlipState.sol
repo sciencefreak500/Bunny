@@ -13,8 +13,8 @@ interface CVaultBSCFlipState {
     }
 
     struct Pool {
-        address vault;
         address flip;
+        address cpool;
 
         mapping (address => Account) accounts;
     }

@@ -38,23 +38,18 @@ import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/math/Math.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
+import "../../interfaces/IUniswapV2Pair.sol";
+import "../interface/ICVaultETHLP.sol";
 import "../interface/ICVaultRelayer.sol";
-import "./CVaultETHLPState.sol";
-import "./CVaultETHLPStorage.sol";
 import "../../zap/IZap.sol";
 import "../../library/Whitelist.sol";
-import "../../interfaces/IUniswapV2Pair.sol";
+import "./CVaultETHLPState.sol";
+import "./CVaultETHLPStorage.sol";
 
-contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
+
+contract CVaultETHLP is ICVaultETHLP, CVaultETHLPStorage, Whitelist {
     using SafeMath for uint;
     using SafeERC20 for IERC20;
-
-    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-
-    uint public constant MINIMUM_DEPOSIT_VALUE = 100e18;
-
-    uint public constant COLLATERAL_RATIO_MIN = 18e17;          // 180%
-    uint public constant COLLATERAL_RATIO_LIQUIDATION = 12e17;  // 120%
 
     uint8 private constant SIG_DEPOSIT = 10;
     uint8 private constant SIG_LEVERAGE = 20;
@@ -66,6 +61,9 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
 
     IZap public zap;
     address public treasury;
+
+    uint public minimumDepositValue;
+    uint public liquidationCollateralRatio;
 
     /* ========== EVENTS ========== */
 
@@ -80,7 +78,7 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
     event NotifyDeposited(address indexed lp, address indexed account, uint indexed eventId, uint bscBNBDebtShare, uint bscFlipBalance);
     event NotifyUpdatedLeverage(address indexed lp, address indexed account, uint indexed eventId, uint bscBNBDebtShare, uint bscFlipBalance);
     event NotifyWithdrawnAll(address indexed lp, address indexed account, uint indexed eventId, uint lpAmount, uint ethProfit, uint ethLoss);
-    event NotifyLiquidated(address indexed lp, address indexed account, uint indexed eventId, uint ethProfit, uint ethLoss, uint penaltyLPAmount);
+    event NotifyLiquidated(address indexed lp, address indexed account, uint indexed eventId, uint ethProfit, uint ethLoss, uint penaltyLPAmount, address liquidator);
     event NotifyResolvedEmergency(address indexed lp, address indexed account, uint indexed eventId);
 
     // User Events
@@ -108,6 +106,9 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
     function initialize() external initializer {
         __CVaultETHLPStorage_init();
         __Whitelist_init();
+
+        minimumDepositValue = 100e18;
+        liquidationCollateralRatio = 12e17;
     }
 
     /* ========== RESTRICTED FUNCTIONS ========== */
@@ -131,54 +132,54 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
         treasury = newTreasury;
     }
 
+    function setMinimumDepositValue(uint newValue) external onlyOwner {
+        require(newValue > 0, "CVaultETHLP: minimum deposit value is zero");
+        minimumDepositValue = newValue;
+    }
+
     /* ========== VIEW FUNCTIONS ========== */
 
-    function validateRequest(
-        uint8 signature,
-        address _lp,
-        address _account,
-        uint _leverage,
-        uint _collateral,
-        address _liquidator) external view returns (uint8, uint) {
+    function validateRequest(uint8 signature, address _lp, address _account, uint128 _leverage, uint _collateral) external override view returns (uint8 validation, uint112 nonce) {
         Account memory account = accountOf(_lp, _account);
-        bool validation = false;
+        bool isValid = false;
         if (signature == SIG_DEPOSIT) {
-            validation =
+            isValid =
             account.state == State.Depositing
             && account.collateral > 0
             && account.collateral == _collateral
             && account.leverage == _leverage
             && account.updatedAt + EMERGENCY_EXIT_TIMELOCK - 10 minutes > block.timestamp;
         } else if (signature == SIG_LEVERAGE) {
-            validation =
+            isValid =
             account.state == State.UpdatingLeverage
             && account.collateral > 0
             && account.collateral == _collateral
             && account.leverage == _leverage
             && account.updatedAt + EMERGENCY_EXIT_TIMELOCK - 10 minutes > block.timestamp;
         } else if (signature == SIG_WITHDRAW) {
-            validation =
+            isValid =
             account.state == State.Withdrawing
             && account.collateral > 0
             && account.leverage == 0
             && account.updatedAt + EMERGENCY_EXIT_TIMELOCK - 10 minutes > block.timestamp;
         } else if (signature == SIG_EMERGENCY) {
-            validation =
+            isValid =
             account.state == State.EmergencyExited
             && account.collateral == 0
             && account.leverage == 0;
         } else if (signature == SIG_LIQUIDATE) {
-            validation =
+            isValid =
             account.state == State.Liquidating
-            && account.liquidator != address(0)
-            && account.liquidator == _liquidator;
+            && account.liquidator != address(0);
         }
-        return (validation ? 1 : 0, account.nonce);
+
+        validation = isValid ? uint8(1) : uint8(0);
+        nonce = account.nonce;
     }
 
-    function canLiquidate(address lp, address _account) public view returns (bool) {
+    function canLiquidate(address lp, address _account) public override view returns (bool) {
         Account memory account = accountOf(lp, _account);
-        return account.state == State.Farming && collateralRatioOf(lp, _account) < COLLATERAL_RATIO_LIQUIDATION;
+        return account.state == State.Farming && collateralRatioOf(lp, _account) < liquidationCollateralRatio;
     }
 
     function collateralRatioOf(address lp, address _account) public view returns (uint) {
@@ -190,7 +191,7 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
 
     function deposit(address lp, uint amount, uint128 leverage) external notPaused notPausedPool(lp) validLeverage(leverage) onlyWhitelisted {
         require(relayer.isUtilizable(lp, amount, leverage), "CVaultETHLP: not enough balance to loan in the bank");
-        require(relayer.valueOfAsset(lp, amount) >= MINIMUM_DEPOSIT_VALUE, "CVaultETHLP: less than minimum deposit");
+        require(relayer.valueOfAsset(lp, amount) >= minimumDepositValue, "CVaultETHLP: less than minimum deposit");
 
         convertState(lp, msg.sender, State.Depositing);
 
@@ -252,7 +253,8 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
         relayer.askLiquidationOnETH(lp, _account, msg.sender);
     }
 
-    function executeLiquidation(address lp, address _account, address _liquidator) external {
+    function executeLiquidation(address lp, address _account, address _liquidator) external override {
+        require(msg.sender == address(relayer), "CVaultETHLP: caller is not relayer");
         if (!canLiquidate(lp, _account)) return;
 
         setLiquidator(lp, _account, _liquidator);
@@ -261,6 +263,11 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
         Account memory account = accountOf(lp, _account);
         uint eventId = relayer.requestRelayOnETH(lp, _account, SIG_LIQUIDATE, account.leverage, account.collateral, account.collateral);
         emit LiquidateRequested(lp, _account, eventId, account.collateral, _liquidator);
+    }
+
+    function updateLiquidationCollateralRatio(uint newCollateralRatio) external onlyOwner {
+        require(newCollateralRatio < COLLATERAL_RATIO_MIN, "CVaultETHLP: liquidation collateral ratio must be lower than COLLATERAL_RATIO_MIN");
+        liquidationCollateralRatio = newCollateralRatio;
     }
 
     function _addCollateral(address lp, address _account, uint amount) private returns (uint collateral) {
@@ -280,12 +287,12 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
 
     /* ========== RELAYER FUNCTIONS ========== */
 
-    function notifyDeposited(address lp, address _account, uint128 eventId, uint112 nonce, uint bscBNBDebt, uint bscFlipBalance) external increaseNonceOnlyRelayers(lp, _account, nonce) {
+    function notifyDeposited(address lp, address _account, uint128 eventId, uint112 nonce, uint bscBNBDebt, uint bscFlipBalance) external override increaseNonceOnlyRelayers(lp, _account, nonce) {
         _notifyDeposited(lp, _account, bscBNBDebt, bscFlipBalance);
         emit NotifyDeposited(lp, _account, eventId, bscBNBDebt, bscFlipBalance);
     }
 
-    function notifyUpdatedLeverage(address lp, address _account, uint128 eventId, uint112 nonce, uint bscBNBDebt, uint bscFlipBalance) external increaseNonceOnlyRelayers(lp, _account, nonce) {
+    function notifyUpdatedLeverage(address lp, address _account, uint128 eventId, uint112 nonce, uint bscBNBDebt, uint bscFlipBalance) external override increaseNonceOnlyRelayers(lp, _account, nonce) {
         _notifyDeposited(lp, _account, bscBNBDebt, bscFlipBalance);
         emit NotifyUpdatedLeverage(lp, _account, eventId, bscBNBDebt, bscFlipBalance);
     }
@@ -297,7 +304,7 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
         setBSCFlipBalance(lp, _account, bscFlipBalance);
     }
 
-    function notifyWithdrawnAll(address lp, address _account, uint128 eventId, uint112 nonce, uint ethProfit, uint ethLoss) external increaseNonceOnlyRelayers(lp, _account, nonce) {
+    function notifyWithdrawnAll(address lp, address _account, uint128 eventId, uint112 nonce, uint ethProfit, uint ethLoss) external override increaseNonceOnlyRelayers(lp, _account, nonce) {
         require(stateOf(lp, _account) == State.Withdrawing, "CVaultETHLP: state not Withdrawing");
         if (ethLoss > 0) {
             _repayLoss(lp, _account, eventId, ethLoss);
@@ -315,13 +322,15 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
         emit NotifyWithdrawnAll(lp, _account, eventId, lpAmount, ethProfit, ethLoss);
     }
 
-    function notifyLiquidated(address lp, address _account, uint128 eventId, uint112 nonce, uint ethProfit, uint ethLoss) external increaseNonceOnlyRelayers(lp, _account, nonce) {
+    function notifyLiquidated(address lp, address _account, uint128 eventId, uint112 nonce, uint ethProfit, uint ethLoss) external override increaseNonceOnlyRelayers(lp, _account, nonce) {
         require(stateOf(lp, _account) == State.Liquidating, "CVaultETHLP: state not Liquidating");
         if (ethLoss > 0) {
             _repayLoss(lp, _account, eventId, ethLoss);
         }
 
         Account memory account = accountOf(lp, _account);
+        address liquidator = account.liquidator;
+
         uint penalty = account.collateral.mul(LIQUIDATION_PENALTY).div(UNIT);
         _payLiquidationPenalty(lp, _account, penalty, account.liquidator);
         _removeCollateral(lp, _account, account.collateral.sub(penalty));
@@ -329,11 +338,10 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
             _payProfit(_account, ethProfit);
         }
         convertState(lp, _account, State.Idle);
-
-        emit NotifyLiquidated(lp, _account, eventId, ethProfit, ethLoss, penalty);
+        emit NotifyLiquidated(lp, _account, eventId, ethProfit, ethLoss, penalty, liquidator);
     }
 
-    function notifyResolvedEmergency(address lp, address _account, uint128 eventId, uint112 nonce) external increaseNonceOnlyRelayers(lp, _account, nonce) {
+    function notifyResolvedEmergency(address lp, address _account, uint128 eventId, uint112 nonce) external override increaseNonceOnlyRelayers(lp, _account, nonce) {
         require(stateOf(lp, _account) == State.EmergencyExited, "CVaultETHLP: state not EmergencyExited");
         convertState(lp, _account, State.Idle);
 
@@ -374,7 +382,6 @@ contract CVaultETHLP is CVaultETHLPStorage, Whitelist {
 
     function _payLiquidationPenalty(address lp, address _account, uint penalty, address liquidator) private {
         require(liquidator != address(0), "CVaultETHLP: liquidator should not be zero");
-
         decreaseCollateral(lp, _account, penalty);
 
         uint fee = penalty.mul(LIQUIDATION_FEE).div(UNIT);

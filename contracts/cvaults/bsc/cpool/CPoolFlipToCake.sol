@@ -9,15 +9,17 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
 import "../../../library/RewardsDistributionRecipientUpgradeable.sol";
+
 import "../../../interfaces/IStrategy.sol";
 import "../../../interfaces/IMasterChef.sol";
 import "../../../interfaces/IBunnyMinter.sol";
+import "../../interface/ICPool.sol";
+
 import "../../../vaults/VaultController.sol";
 import {PoolConstant} from "../../../library/PoolConstant.sol";
-import "./ICPool.sol";
 
 
-contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDistributionRecipientUpgradeable, ReentrancyGuardUpgradeable {
+contract CPoolFlipToCake is ICPool, VaultController, IStrategy, RewardsDistributionRecipientUpgradeable, ReentrancyGuardUpgradeable {
     using SafeMath for uint;
     using SafeBEP20 for IBEP20;
 
@@ -46,7 +48,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
     uint public override pid;
     mapping (address => uint) private _depositedAt;
 
-    address public farmer;
+    address public cvaultBSC;
 
     /* ========== MODIFIERS ========== */
 
@@ -60,8 +62,8 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
         _;
     }
 
-    modifier onlyFarmer {
-        require(msg.sender == farmer, 'CrossVaultFlipToCake: not farmer');
+    modifier onlyCVaultBSC {
+        require(msg.sender == cvaultBSC, 'CPoolFlipToCake: caller is not the cvaultBSC');
         _;
     }
 
@@ -72,7 +74,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
 
     /* ========== INITIALIZER ========== */
 
-    function initialize(uint _pid, address _farmer) external initializer {
+    function initialize(uint _pid, address _cvaultBSC) external initializer {
         (address _token,,,) = CAKE_MASTER_CHEF.poolInfo(_pid);
         __VaultController_init(IBEP20(_token));
         __RewardsDistributionRecipient_init();
@@ -88,7 +90,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
 //        setMinter(IBunnyMinter(0x0B4A714AAf59E46cb1900E3C031017Fd72667EfE));
         setRewardsToken(0xEDfcB78e73f7bA6aD2D829bf5D462a0924da28eD);
 
-        farmer = _farmer;
+        cvaultBSC = _cvaultBSC;
     }
 
     /* ========== VIEWS ========== */
@@ -153,8 +155,8 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
 
     /* ========== MUTATIVE FUNCTIONS ========== */
 
-    function deposit(address to, uint amount) external override nonReentrant notPaused updateReward(to) onlyFarmer {
-        require(amount > 0, "CrossVaultFlipToCake: amount must be greater than zero");
+    function deposit(address to, uint amount) external override nonReentrant notPaused updateReward(to) onlyCVaultBSC {
+        require(amount > 0, "CPoolFlipToCake: amount must be greater than zero");
         _totalSupply = _totalSupply.add(amount);
         _balances[to] = _balances[to].add(amount);
         _depositedAt[to] = block.timestamp;
@@ -177,8 +179,8 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
         revert("N/A");
     }
 
-    function withdraw(address to, uint amount) public override nonReentrant updateReward(to) onlyFarmer {
-        require(amount > 0, "CrossVaultFlipToCake: amount must be greater than zero");
+    function withdraw(address to, uint amount) public override nonReentrant updateReward(to) onlyCVaultBSC {
+        require(amount > 0, "CPoolFlipToCake: amount must be greater than zero");
         _totalSupply = _totalSupply.sub(amount);
         _balances[to] = _balances[to].sub(amount);
         CAKE_MASTER_CHEF.withdraw(pid, amount);
@@ -192,7 +194,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
         revert("N/A");
     }
 
-    function withdrawAll(address to) external override onlyFarmer {
+    function withdrawAll(address to) external override onlyCVaultBSC {
         uint _withdraw = withdrawableBalanceOf(to);
         if (_withdraw > 0) {
             withdraw(to, _withdraw);
@@ -204,7 +206,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
         revert("N/A");
     }
 
-    function getReward(address to) public override nonReentrant updateReward(to) onlyFarmer {
+    function getReward(address to) public override nonReentrant updateReward(to) onlyCVaultBSC {
         uint reward = rewards[to];
         if (reward > 0) {
             rewards[to] = 0;
@@ -239,7 +241,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
     }
 
     function setRewardsToken(address newRewardsToken) public onlyOwner {
-        require(address(_rewardsToken) == address(0), "CrossVaultFlipToCake: rewards token already set");
+        require(address(_rewardsToken) == address(0), "CPoolFlipToCake: rewards token already set");
 
         _rewardsToken = IStrategy(newRewardsToken);
         IBEP20(CAKE).safeApprove(newRewardsToken, 0);
@@ -264,7 +266,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
         // very high values of rewardRate in the earned and rewardsPerToken functions;
         // Reward + leftover must be less than 2^256 / 10^18 to avoid overflow.
         uint _balance = _rewardsToken.sharesOf(address(this));
-        require(rewardRate <= _balance.div(rewardsDuration), "CrossVaultFlipToCake: reward rate must be in the right range");
+        require(rewardRate <= _balance.div(rewardsDuration), "CPoolFlipToCake: reward rate must be in the right range");
 
         lastUpdateTime = block.timestamp;
         periodFinish = block.timestamp.add(rewardsDuration);
@@ -272,7 +274,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
     }
 
     function setRewardsDuration(uint _rewardsDuration) external onlyOwner {
-        require(periodFinish == 0 || block.timestamp > periodFinish, "CrossVaultFlipToCake: reward duration can only be updated after the period ends");
+        require(periodFinish == 0 || block.timestamp > periodFinish, "CPoolFlipToCake: reward duration can only be updated after the period ends");
         rewardsDuration = _rewardsDuration;
         emit RewardsDurationUpdated(rewardsDuration);
     }
@@ -280,7 +282,7 @@ contract CPoolBSCPoolFlipToCake is VaultController, IStrategy, ICPool, RewardsDi
     /* ========== SALVAGE PURPOSE ONLY ========== */
 
     function recoverToken(address tokenAddress, uint tokenAmount) external override onlyOwner {
-        require(tokenAddress != address(_stakingToken) && tokenAddress != _rewardsToken.stakingToken(), "CrossVaultFlipToCake: cannot recover underlying token");
+        require(tokenAddress != address(_stakingToken) && tokenAddress != _rewardsToken.stakingToken(), "CPoolFlipToCake: cannot recover underlying token");
         IBEP20(tokenAddress).safeTransfer(owner(), tokenAmount);
         emit Recovered(tokenAddress, tokenAmount);
     }

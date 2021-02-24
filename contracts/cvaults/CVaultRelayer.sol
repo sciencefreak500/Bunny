@@ -36,16 +36,13 @@ pragma experimental ABIEncoderV2;
 import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
+import "./interface/ICVaultRelayer.sol";
 import "./interface/ICVaultETHLP.sol";
 import "./interface/ICVaultBSCFlip.sol";
-import "./interface/ICVaultRelayer.sol";
 
 
 contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     using SafeMath for uint;
-
-    uint public constant CHAIN_ID_ETH = 1;
-    uint public constant CHAIN_ID_BSC = 56;
 
     uint8 public constant SIG_DEPOSIT = 10;
     uint8 public constant SIG_LEVERAGE = 20;
@@ -73,7 +70,6 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     mapping(uint128 => RelayLiquidation) public liquidations;
 
     mapping(address => bool) private _relayHandlers;
-    mapping(address => uint) private _tokenDecimals;
     mapping(address => uint) private _tokenPrices;
 
     /* ========== EVENTS ========== */
@@ -100,18 +96,10 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
         require(owner() != address(0), "CVaultRelayer: owner must be set");
     }
 
-    /* ========== PURE FUNCTIONS ========== */
-
-    function getChainId() internal pure returns (uint) {
-        uint chainId;
-        assembly {chainId := chainid()}
-        return chainId;
-    }
-
     /* ========== RELAY VIEW FUNCTIONS ========== */
 
     function getPendingRequestsOnETH(uint128 limit) public view returns (RelayRequest[] memory) {
-        if (pendingId < completeId || getChainId() != CHAIN_ID_ETH) {
+        if (pendingId < completeId) {
             return new RelayRequest[](0);
         }
 
@@ -119,12 +107,12 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
         count = count > limit ? limit : count;
         RelayRequest[] memory pendingRequests = new RelayRequest[](count);
 
-        ICVaultETHLP CVaultETHLP = ICVaultETHLP(cvaultETH);
+        ICVaultETHLP cvaultETHLP = ICVaultETHLP(cvaultETH);
         for (uint128 index = 0; index < count; index++) {
             uint128 requestId = completeId + index + uint128(1);
             RelayRequest memory request = requests[requestId];
 
-            (uint8 validation, uint112 nonce) = CVaultETHLP.validateRequest(request.signature, request.lp, request.account, request.leverage, request.collateral);
+            (uint8 validation, uint112 nonce) = cvaultETHLP.validateRequest(request.signature, request.lp, request.account, request.leverage, request.collateral);
             request.validation = validation;
             request.nonce = nonce;
 
@@ -134,7 +122,7 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     }
 
     function getPendingResponsesOnBSC(uint128 limit) public view returns (RelayResponse[] memory) {
-        if (pendingId < completeId || getChainId() != CHAIN_ID_BSC) {
+        if (pendingId < completeId) {
             return new RelayResponse[](0);
         }
 
@@ -151,10 +139,25 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     }
 
     function getPendingLiquidationCountOnETH() public view returns (uint) {
-        if (pendingId < completeId || getChainId() != CHAIN_ID_ETH) {
+        if (liqPendingId < liqCompleteId) {
             return 0;
         }
         return liqPendingId - liqCompleteId;
+    }
+
+    function canAskLiquidation(address lp, address account, address liquidator) public view returns (bool) {
+        if (liqPendingId < liqCompleteId) {
+            return true;
+        }
+
+        uint128 count = liqPendingId - liqCompleteId;
+        for (uint128 liqId = liqPendingId; liqId > liqPendingId - count; liqId--) {
+            RelayLiquidation memory each = liquidations[liqId];
+            if (each.lp == lp && each.account == account && each.liquidator == liquidator) {
+                return false;
+            }
+        }
+        return true;
     }
 
     function getHistoriesOf(uint128[] calldata selector) public view returns (RelayHistory[] memory) {
@@ -181,6 +184,7 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
         uint lpValue = valueOfAsset(lp, lpAmount);
         uint flipValue = valueOfAsset(flip, flipAmount);
         uint debtValue = valueOfAsset(BNB, debt);
+
         if (debtValue == 0) {
             return uint(- 1);
         }
@@ -189,6 +193,10 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
 
     function utilizationInfo() public override view returns (uint total, uint utilized) {
         return (totalBNBSupply, utilizedBNBSupply);
+    }
+
+    function utilizationInfoOnBSC() public view returns (uint total, uint utilized) {
+        (total, utilized) = ICVaultBSCFlip(cvaultBSC).getUtilizationInfo();
     }
 
     function isUtilizable(address lp, uint amount, uint leverage) external override view returns (bool) {
@@ -212,12 +220,6 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
         _relayHandlers[newRelayHandler] = permission;
     }
 
-    function setDecimalData(address[] calldata tokens, uint[] calldata decimals) external onlyOwner {
-        for (uint index = 0; index < tokens.length; index++) {
-            _tokenDecimals[tokens[index]] = decimals[index];
-        }
-    }
-
     /* ========== RELAY FUNCTIONS ========== */
     /*
     * tx 1.   CVaultETH           requestRelayOnETH          -> CVaultRelayer enqueues request
@@ -228,23 +230,20 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     * tx 3-3. CVaultRelayHandlers syncCompletedRelaysOnBSC   -> CVaultRelayer synchronize completeId
     */
 
-    function requestRelayOnETH(address lp, address account, uint8 signature, uint128 leverage, uint collateral, uint lpAmount) public override onlyCVaultETH returns(uint requestId) {
-        require(getChainId() == CHAIN_ID_ETH, "CVaultRelayer: invalid chain id");
-
+    function requestRelayOnETH(address lp, address account, uint8 signature, uint128 leverage, uint collateral, uint lpAmount) public override onlyCVaultETH returns (uint requestId) {
         pendingId++;
         RelayRequest memory request = RelayRequest({
         lp : lp, account : account, signature : signature, validation : uint8(0), nonce : uint112(0), requestId : pendingId,
-        leverage : leverage, collateral : collateral, lpValue: valueOfAsset(lp, lpAmount)
+        leverage : leverage, collateral : collateral, lpValue : valueOfAsset(lp, lpAmount)
         });
         requests[pendingId] = request;
         return pendingId;
     }
 
     function transferRelaysOnBSC(RelayRequest[] memory _requests) external onlyRelayHandlers {
-        require(getChainId() == CHAIN_ID_BSC, "CVaultRelayer: invalid chain id");
         require(cvaultBSC != address(0), "CVaultRelayer: cvaultBSC must be set");
 
-        ICVaultBSCFlip CVaultBSCFlip = ICVaultBSCFlip(cvaultBSC);
+        ICVaultBSCFlip cvaultBSCFlip = ICVaultBSCFlip(cvaultBSC);
         for (uint index = 0; index < _requests.length; index++) {
             RelayRequest memory request = _requests[index];
             RelayResponse memory response = RelayResponse({
@@ -255,23 +254,23 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
 
             if (request.validation != uint8(0)) {
                 if (request.signature == SIG_DEPOSIT) {
-                    (uint bscBNBDebtShare, uint bscFlipBalance) = CVaultBSCFlip.deposit(request.lp, request.account, request.requestId, request.nonce, request.leverage, request.collateral);
+                    (uint bscBNBDebtShare, uint bscFlipBalance) = cvaultBSCFlip.deposit(request.lp, request.account, request.requestId, request.nonce, request.leverage, request.collateral);
                     response.bscBNBDebtShare = bscBNBDebtShare;
                     response.bscFlipBalance = bscFlipBalance;
                 } else if (request.signature == SIG_LEVERAGE) {
-                    (uint bscBNBDebtShare, uint bscFlipBalance) = CVaultBSCFlip.updateLeverage(request.lp, request.account, request.requestId, request.nonce, request.leverage, request.collateral);
+                    (uint bscBNBDebtShare, uint bscFlipBalance) = cvaultBSCFlip.updateLeverage(request.lp, request.account, request.requestId, request.nonce, request.leverage, request.collateral);
                     response.bscBNBDebtShare = bscBNBDebtShare;
                     response.bscFlipBalance = bscFlipBalance;
                 } else if (request.signature == SIG_WITHDRAW) {
-                    (uint ethProfit, uint ethLoss) = CVaultBSCFlip.withdrawAll(request.lp, request.account, request.requestId, request.nonce);
+                    (uint ethProfit, uint ethLoss) = cvaultBSCFlip.withdrawAll(request.lp, request.account, request.requestId, request.nonce);
                     response.ethProfit = ethProfit;
                     response.ethLoss = ethLoss;
                 } else if (request.signature == SIG_EMERGENCY) {
-                    (uint ethProfit, uint ethLoss) = CVaultBSCFlip.emergencyExit(request.lp, request.account, request.requestId, request.nonce);
+                    (uint ethProfit, uint ethLoss) = cvaultBSCFlip.emergencyExit(request.lp, request.account, request.requestId, request.nonce);
                     response.ethProfit = ethProfit;
                     response.ethLoss = ethLoss;
                 } else if (request.signature == SIG_LIQUIDATE) {
-                    (uint ethProfit, uint ethLoss) = CVaultBSCFlip.liquidate(request.lp, request.account, request.requestId, request.nonce);
+                    (uint ethProfit, uint ethLoss) = cvaultBSCFlip.liquidate(request.lp, request.account, request.requestId, request.nonce);
                     response.ethProfit = ethProfit;
                     response.ethLoss = ethLoss;
                 }
@@ -282,40 +281,39 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
             pendingId++;
         }
 
-        (totalBNBSupply, utilizedBNBSupply) = ICVaultBSCFlip(cvaultBSC).lender().getUtilizationInfo();
+        (totalBNBSupply, utilizedBNBSupply) = cvaultBSCFlip.getUtilizationInfo();
     }
 
-    function completeRelaysOnETH(RelayResponse[] memory _responses, uint _totalBNBSupply, uint _utilizedBNBSupply) external onlyRelayHandlers {
-        require(getChainId() == CHAIN_ID_ETH, "CVaultRelayer: invalid chain id");
-        totalBNBSupply = _totalBNBSupply;
-        utilizedBNBSupply = _utilizedBNBSupply;
+    function completeRelaysOnETH(RelayResponse[] memory _responses, RelayUtilization memory utilization) external onlyRelayHandlers {
+        totalBNBSupply = utilization.totalSupply;
+        utilizedBNBSupply = utilization.utilized;
 
         for (uint index = 0; index < _responses.length; index++) {
             RelayResponse memory response = _responses[index];
             bool success;
             if (response.validation != uint8(0)) {
                 if (response.signature == SIG_DEPOSIT) {
-                    (success, ) = cvaultETH.call(
+                    (success,) = cvaultETH.call(
                         abi.encodeWithSignature("notifyDeposited(address,address,uint128,uint112,uint256,uint256)",
                         response.lp, response.account, response.requestId, response.nonce, response.bscBNBDebtShare, response.bscFlipBalance)
                     );
                 } else if (response.signature == SIG_LEVERAGE) {
-                    (success, ) = cvaultETH.call(
+                    (success,) = cvaultETH.call(
                         abi.encodeWithSignature("notifyUpdatedLeverage(address,address,uint128,uint112,uint256,uint256)",
                         response.lp, response.account, response.requestId, response.nonce, response.bscBNBDebtShare, response.bscFlipBalance)
                     );
                 } else if (response.signature == SIG_WITHDRAW) {
-                    (success, ) = cvaultETH.call(
+                    (success,) = cvaultETH.call(
                         abi.encodeWithSignature("notifyWithdrawnAll(address,address,uint128,uint112,uint256,uint256)",
                         response.lp, response.account, response.requestId, response.nonce, response.ethProfit, response.ethLoss)
                     );
                 } else if (response.signature == SIG_EMERGENCY) {
-                    (success, ) = cvaultETH.call(
+                    (success,) = cvaultETH.call(
                         abi.encodeWithSignature("notifyResolvedEmergency(address,address,uint128,uint112)",
                         response.lp, response.account, response.requestId, response.nonce)
                     );
                 } else if (response.signature == SIG_LIQUIDATE) {
-                    (success, ) = cvaultETH.call(
+                    (success,) = cvaultETH.call(
                         abi.encodeWithSignature("notifyLiquidated(address,address,uint128,uint112,uint256,uint256)",
                         response.lp, response.account, response.requestId, response.nonce, response.ethProfit, response.ethLoss)
                     );
@@ -333,16 +331,19 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     }
 
     function syncCompletedRelaysOnBSC(uint128 _count) external onlyRelayHandlers {
-        require(getChainId() == CHAIN_ID_BSC, "CVaultRelayer: invalid chain id");
-
         completeId = completeId + _count;
         emit RelayCompleted(completeId, _count);
+    }
+
+    function syncUtilization(RelayUtilization memory utilization) external onlyRelayHandlers {
+        totalBNBSupply = utilization.totalSupply;
+        utilizedBNBSupply = utilization.utilized;
     }
 
     /* ========== LIQUIDATION FUNCTIONS ========== */
 
     function askLiquidationOnETH(address lp, address account, address liquidator) public override onlyCVaultETH {
-        require(getChainId() == CHAIN_ID_ETH, "CVaultRelayer: invalid chain id");
+        require(canAskLiquidation(lp, account, liquidator), "CVaultRelayer: cannot ask liquidation");
 
         liqPendingId++;
         RelayLiquidation memory liquidation = RelayLiquidation({lp : lp, account : account, liquidator : liquidator});
@@ -350,14 +351,13 @@ contract CVaultRelayer is ICVaultRelayer, OwnableUpgradeable {
     }
 
     function executeLiquidationOnETH() external onlyRelayHandlers {
-        require(getChainId() == CHAIN_ID_ETH, "CVaultRelayer: invalid chain id");
         require(liqPendingId > liqCompleteId, "CVaultRelayer: no pending liquidations");
 
-        ICVaultETHLP CVaultETHLP = ICVaultETHLP(cvaultETH);
+        ICVaultETHLP cvaultETHLP = ICVaultETHLP(cvaultETH);
         for (uint128 index = 0; index < liqPendingId - liqCompleteId; index++) {
             RelayLiquidation memory each = liquidations[liqCompleteId + index + uint128(1)];
-            CVaultETHLP.executeLiquidation(each.lp, each.account, each.liquidator);
-            completeId++;
+            cvaultETHLP.executeLiquidation(each.lp, each.account, each.liquidator);
+            liqCompleteId++;
         }
     }
 

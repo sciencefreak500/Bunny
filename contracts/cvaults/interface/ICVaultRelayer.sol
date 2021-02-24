@@ -66,6 +66,11 @@ interface ICVaultRelayer {
         address liquidator;
     }
 
+    struct RelayUtilization {
+        uint totalSupply;
+        uint utilized;
+    }
+
     struct RelayHistory {
         uint128 requestId;
         RelayRequest request;
